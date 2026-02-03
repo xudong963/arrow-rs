@@ -586,5 +586,126 @@ impl AsyncFileReader for InMemoryReader {
     }
 }
 
-criterion_group!(benches, benchmark_filters_and_projections,);
+/// Benchmark the performance improvement of skipping predicate evaluation
+/// for fully-matched row groups.
+///
+/// Creates a parquet file with 10 row groups (10K rows each, 100K total).
+/// Tests multiple filter types to show how savings scale with filter cost.
+/// Filter columns are excluded from the output projection to maximize
+/// the observable benefit (skipping avoids decoding entire extra columns).
+///
+/// For each filter type, compares:
+/// - `no_skip`: All row groups have their predicate evaluated (baseline)
+/// - `all_skip`: All row groups marked as fully matched (ceiling of improvement)
+fn benchmark_skip_fully_matched(c: &mut Criterion) {
+    // Create a multi-row-group file
+    let batch = create_record_batch(100_000);
+    let schema = batch.schema();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(10_000) // 10 row groups
+        .build();
+    let mut buffer = vec![];
+    {
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let parquet_file = Bytes::from(buffer);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("skip_fully_matched");
+
+    let reader = InMemoryReader::try_new(&parquet_file).unwrap();
+    let metadata = Arc::clone(reader.metadata());
+    let num_row_groups = metadata.num_row_groups();
+    let schema_descr = metadata.file_metadata().schema_descr();
+    let skip_set: std::collections::HashSet<usize> = (0..num_row_groups).collect();
+
+    // Test multiple filter types, ordered by expected savings (most to least):
+    // - Utf8ViewNonEmpty: expensive string column decoding + comparison
+    // - Composite: two filter columns (float64 + ts) to skip
+    // - UnselectiveClustered: cheap timestamp filter (minimal savings)
+    //
+    // Filter columns are excluded from the output projection to maximize
+    // the observable benefit (skipping avoids decoding entire extra columns).
+    let filter_cases: Vec<(&str, FilterType)> = vec![
+        ("utf8view_ne_empty", FilterType::Utf8ViewNonEmpty),
+        ("composite_2col", FilterType::Composite),
+        ("ts_lt_9000", FilterType::UnselectiveClustered),
+    ];
+
+    let all_indices: Vec<usize> = vec![0, 1, 2, 3];
+
+    for (case_name, filter_type) in &filter_cases {
+        let filter_col = filter_type.filter_projection().to_vec();
+        let pred_mask = ProjectionMask::roots(schema_descr, filter_col.clone());
+
+        // Exclude filter columns from output projection to maximize savings:
+        // when skipping, we avoid decoding the filter columns entirely.
+        let output_indices: Vec<usize> = all_indices
+            .iter()
+            .copied()
+            .filter(|i| !filter_col.contains(i))
+            .collect();
+        let projection_mask = ProjectionMask::roots(schema_descr, output_indices);
+
+        // Benchmark: no skip (baseline)
+        let filter_type = *filter_type;
+        let bench_id = BenchmarkId::new(*case_name, "no_skip");
+        let rt_captured = rt.handle().clone();
+        let reader_clone = reader.clone();
+        let pred_mask_clone = pred_mask.clone();
+        let proj_clone = projection_mask.clone();
+        group.bench_function(bench_id, |b| {
+            b.iter(|| {
+                let reader = reader_clone.clone();
+                let pred_mask = pred_mask_clone.clone();
+                let projection_mask = proj_clone.clone();
+                let filter = ArrowPredicateFn::new(pred_mask, move |batch: RecordBatch| {
+                    Ok(filter_type.filter_batch(&batch).unwrap())
+                });
+                let row_filter = RowFilter::new(vec![Box::new(filter)]);
+                rt_captured.block_on(async {
+                    benchmark_async_reader(reader, projection_mask, row_filter).await;
+                })
+            });
+        });
+
+        // Benchmark: all row groups skipped (ceiling of improvement)
+        let bench_id = BenchmarkId::new(*case_name, "all_skip");
+        let rt_captured = rt.handle().clone();
+        let reader_clone = reader.clone();
+        let pred_mask_clone = pred_mask.clone();
+        let proj_clone = projection_mask.clone();
+        group.bench_function(bench_id, |b| {
+            b.iter(|| {
+                let reader = reader_clone.clone();
+                let pred_mask = pred_mask_clone.clone();
+                let projection_mask = proj_clone.clone();
+                let skip_set = skip_set.clone();
+                let filter = ArrowPredicateFn::new(pred_mask, move |batch: RecordBatch| {
+                    Ok(filter_type.filter_batch(&batch).unwrap())
+                });
+                let row_filter =
+                    RowFilter::new(vec![Box::new(filter)]).with_skip_row_groups(skip_set);
+                rt_captured.block_on(async {
+                    benchmark_async_reader(reader, projection_mask, row_filter).await;
+                })
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    benchmark_filters_and_projections,
+    benchmark_skip_fully_matched,
+);
 criterion_main!(benches);

@@ -18,6 +18,7 @@
 use crate::arrow::ProjectionMask;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
+use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 
 /// A predicate operating on [`RecordBatch`]
@@ -177,6 +178,9 @@ where
 pub struct RowFilter {
     /// A list of [`ArrowPredicate`]
     pub(crate) predicates: Vec<Box<dyn ArrowPredicate>>,
+    /// Row group indices for which predicate evaluation should be skipped
+    /// because all rows are known to match.
+    pub(crate) skip_predicate_row_groups: HashSet<usize>,
 }
 
 impl Debug for RowFilter {
@@ -188,7 +192,17 @@ impl Debug for RowFilter {
 impl RowFilter {
     /// Create a new [`RowFilter`] from an array of [`ArrowPredicate`]
     pub fn new(predicates: Vec<Box<dyn ArrowPredicate>>) -> Self {
-        Self { predicates }
+        Self {
+            predicates,
+            skip_predicate_row_groups: HashSet::new(),
+        }
+    }
+
+    /// Mark the given row groups as fully matched — predicate evaluation
+    /// will be skipped for these row groups (all rows returned as-is).
+    pub fn with_skip_row_groups(mut self, row_groups: HashSet<usize>) -> Self {
+        self.skip_predicate_row_groups = row_groups;
+        self
     }
     /// Returns the inner predicates
     pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {

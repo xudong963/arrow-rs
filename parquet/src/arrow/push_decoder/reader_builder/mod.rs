@@ -323,6 +323,19 @@ impl RowGroupReaderBuilder {
                     }));
                 };
 
+                // Skip predicate evaluation for fully-matched row groups
+                if filter
+                    .skip_predicate_row_groups
+                    .contains(&row_group_info.row_group_idx)
+                {
+                    self.filter = Some(filter); // put back for next row group
+                    return Ok(NextState::again(RowGroupDecoderState::StartData {
+                        row_group_info,
+                        column_chunks,
+                        cache_info: None,
+                    }));
+                }
+
                 // we have predicates to evaluate
                 let cache_projection =
                     self.compute_cache_projection(row_group_info.row_group_idx, &filter);
@@ -722,6 +735,6 @@ mod tests {
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
-        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 200);
+        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 248);
     }
 }
